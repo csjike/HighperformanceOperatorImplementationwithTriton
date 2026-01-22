@@ -1,4 +1,4 @@
-# Triton-Ascend 高性能矩阵乘法算子（V5 增强版）
+# Triton-Ascend 高性能矩阵乘法算子
 
 ## 项目介绍
 
