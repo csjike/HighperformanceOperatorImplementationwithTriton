@@ -33,6 +33,8 @@ MATRIX_SHAPES = [
     (4096, 4096, 4096),    # Large Square
     (2048, 1024, 4096),    # Rectangular (K-dominant)
     (4096, 4096, 1024),    # Rectangular (M, N dominant)
+    (4096,8192,4096),
+    (2048,8192,2048),
  (4096,32,4096),
     (2048,32,2048),
     (4096,32,2048)
@@ -114,6 +116,92 @@ def _matmat_core_logic(
     return accumulator, pid_m, pid_n, msk_m, msk_n
 
 @triton.jit
+def matmul_splitk_stage1(
+    a_ptr, b_ptr, c_partial_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_pk, stride_pm, stride_pn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_SPLITS: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    num_k_tiles = tl.cdiv(K, BLOCK_K)
+
+    # split-K 核心：stride = K_SPLITS
+    for k in range(pid_k, num_k_tiles, K_SPLITS):
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + (k * BLOCK_K + offs_k)[None, :] * stride_ak
+        b_ptrs = b_ptr + (k * BLOCK_K + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (k * BLOCK_K + offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_n[None, :] < N) & (k * BLOCK_K + offs_k[:, None] < K),
+            other=0.0,
+        )
+
+        acc = tl.dot(a, b, acc)
+
+    # 写 partial
+    # compute base offset (in elements) for this (pid_k, pid_m, pid_n)
+    base_off = pid_k * stride_pk + pid_m * stride_pm + pid_n * stride_pn
+    c_ptrs = c_partial_ptr + base_off + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
+
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+@triton.jit
+def matmul_splitk_stage2(
+    c_partial_ptr, c_ptr,
+    M, N,
+    stride_pk, stride_pm, stride_pn,
+    stride_cm, stride_cn,
+    K_SPLITS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(K_SPLITS):
+        # compute base offset for this k,pid_m,pid_n
+        base_off = k * stride_pk + pid_m * stride_pm + pid_n * stride_pn
+        ptrs = c_partial_ptr + base_off + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
+        acc += tl.load(ptrs, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N), other=0.0)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(
+        c_ptrs,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+
+@triton.jit
 def _matmat_single_writeback(
     c_ptr, accumulator, pid_m, pid_n, M, N, stride_cm, stride_cn,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, ACTIVATION: tl.constexpr
@@ -142,6 +230,8 @@ def _matmat_parallel_writeback(
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, vec_sub_blk, mask=c_mask)
+
+
 
 def create_kernel(name: str, autotune_configs: List[triton.Config], parallel: bool, k_splits: int = 1) -> Callable:
     """Dynamically creates a JIT kernel with specified autotune configs and parallelism."""
@@ -189,11 +279,154 @@ def create_kernel(name: str, autotune_configs: List[triton.Config], parallel: bo
 
     return kernel
 
+def create_kernel_SplitK(
+    name: str,
+    autotune_configs: List[triton.Config],
+    parallel: bool,
+    k_splits: int = 1,
+) -> Callable:
+    """
+    Returns a callable that performs matmul.
+    If k_splits > 1, uses true two-stage split-K.
+    """
+
+    # =========================
+    # Stage 1: split-K compute
+    # =========================
+    @triton.autotune(
+        configs=autotune_configs,
+        key=["M", "N", "K"],
+    )
+    @triton.jit
+    def _stage1_kernel(
+        a_ptr, b_ptr, c_partial_ptr,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_pk, stride_pm, stride_pn,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr,
+        K_SPLITS: tl.constexpr,
+    ):
+        matmul_splitk_stage1(
+            a_ptr, b_ptr,
+            c_partial_ptr,
+            M, N, K,
+            stride_am, stride_ak,
+            stride_bk, stride_bn,
+            stride_pk, stride_pm, stride_pn,
+            BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K,
+            K_SPLITS,
+        )
+
+    # =========================
+    # Stage 2: reduce kernel
+    # =========================
+    @triton.jit
+    def _stage2_kernel(
+        c_partial_ptr, c_ptr,
+        M, N,
+        stride_pk, stride_pm, stride_pn,
+        stride_cm, stride_cn,
+        K_SPLITS: tl.constexpr,
+        BLOCK_SIZE_M: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        matmul_splitk_stage2(
+            c_partial_ptr,
+            c_ptr,
+            M, N,
+            stride_pk, stride_pm, stride_pn,
+            stride_cm, stride_cn,
+            K_SPLITS,
+            BLOCK_SIZE_M, BLOCK_SIZE_N,
+        )
+
+    # =========================
+    # Python wrapper (关键)
+    # =========================
+    def kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor):
+        #assert a.is_cuda and b.is_cuda and c.is_cuda
+        assert a.dtype == b.dtype
+
+        M, K = a.shape
+        K2, N = b.shape
+        assert K == K2
+
+        # strides (in elements)
+        stride_am, stride_ak = a.stride()
+        stride_bk, stride_bn = b.stride()
+        stride_cm, stride_cn = c.stride()
+
+        BLOCK_M = autotune_configs[0].kwargs["BLOCK_SIZE_M"]
+        BLOCK_N = autotune_configs[0].kwargs["BLOCK_SIZE_N"]
+        BLOCK_K = autotune_configs[0].kwargs["BLOCK_SIZE_K"]
+
+        grid_m = triton.cdiv(M, BLOCK_M)
+        grid_n = triton.cdiv(N, BLOCK_N)
+
+        # ==============
+        # No split-K
+        # ==============
+        if k_splits == 1:
+            grid = (grid_m, grid_n)
+            _stage1_kernel[grid](
+                a, b, c,
+                M=M, N=N, K=K,
+                stride_am=stride_am, stride_ak=stride_ak,
+                stride_bk=stride_bk, stride_bn=stride_bn,
+                stride_pk=0, stride_pm=stride_cm, stride_pn=stride_cn,
+                K_SPLITS=1,
+            )
+            return
+
+        # ===================
+        # True split-K path
+        # ===================
+        # allocate partial buffer: [K_SPLITS, M, N] in blocks
+        c_partial = torch.empty(
+            (k_splits, M, N),
+            device=c.device,
+            dtype=torch.float32,
+        )
+
+        stride_pk, stride_pm, stride_pn = c_partial.stride()
+
+        # ---- Stage 1 ----
+        grid = (grid_m, grid_n, k_splits)
+        _stage1_kernel[grid](
+            a, b, c_partial,
+            M=M, N=N, K=K,
+            stride_am=stride_am, stride_ak=stride_ak,
+            stride_bk=stride_bk, stride_bn=stride_bn,
+            stride_pk=stride_pk, stride_pm=stride_pm, stride_pn=stride_pn,
+            K_SPLITS=k_splits,
+        )
+
+        # ---- Stage 2 ----
+        grid = (grid_m, grid_n)
+        _stage2_kernel[grid](
+            c_partial, c,
+            M, N,
+            stride_pk, stride_pm, stride_pn,
+            stride_cm, stride_cn,
+            k_splits,
+            BLOCK_M, BLOCK_N,
+        )
+
+    kernel.parallel_flag = parallel
+    kernel.k_splits = k_splits
+    kernel.__name__ = name
+
+    return kernel
+
 KERNEL_V1 = create_kernel("V1_Baseline", AUTOTUNE_CONFIGS_BASE, parallel=False)
 KERNEL_V2 = create_kernel("V2_Opt_Autotune", AUTOTUNE_CONFIGS_FULL, parallel=False)
 KERNEL_V3 = create_kernel("V3_Opt_NPU_Parallel", AUTOTUNE_CONFIGS_BASE, parallel=True)
 KERNEL_V4 = create_kernel("V4_Opt_Full", AUTOTUNE_CONFIGS_FULL, parallel=True)
 KERNEL_V4_KPAR = create_kernel("V4_Opt_Full_KPAR", AUTOTUNE_CONFIGS_FULL, parallel=True, k_splits=2)
+KERNEL_V5_SplitK = create_kernel_SplitK("V5_Opt_Full_SplitK", AUTOTUNE_CONFIGS_FULL, parallel=True, k_splits=4)
 # use relu_custom for this KPAR variant
 #KERNEL_V4_KPAR.activation = "relu_custom"
 
@@ -240,9 +473,28 @@ def matmul_wrapper(a, b, kernel_func):
         return c_final.to(torch.float16)
     return c
 
+def matmul_wrapper_splitK(a, b, kernel_func):
+    """
+    kernel_func is a Python callable returned by create_kernel_SplitK
+    """
+    assert a.shape[1] == b.shape[0]
+
+    M, K = a.shape
+    _, N = b.shape
+
+    # 输出张量
+    c = torch.empty((M, N), device=a.device, dtype=torch.float16)
+
+    # 直接调用 Python wrapper
+    kernel_func(a, b, c)
+
+    return c
+
+
 EXPERIMENT_VERSIONS = {
     "V1_Baseline (Base Config | No Parallel)": KERNEL_V1,
     "V4_Opt_Full_KPAR (Full Config | Parallel | K-axis Parallelism)": KERNEL_V4_KPAR,
+    "V5_Opt_Full_SplitK (Full Config | Parallel | Split-K)": KERNEL_V5_SplitK,
 }
 
 def run_performance_test():
@@ -270,6 +522,10 @@ def run_performance_test():
                     a=a.contiguous()
                     b=b.contiguous()
                     matmul_wrapper(a, b, kernel_func)
+                if kernel_func == KERNEL_V5_SplitK:
+                    a=a.contiguous()
+                    b=b.contiguous()
+                    matmul_wrapper_splitK(a, b, kernel_func)
                 else:
                     matmul_wrapper(a, b, kernel_func)
         torch.npu.synchronize()
@@ -283,7 +539,10 @@ def run_performance_test():
 
             for _ in range(NUM_TEST_RUNS):
                 start_event.record()
-                output = matmul_wrapper(a, b, kernel_func)
+                if kernel_func == KERNEL_V5_SplitK:
+                    output = matmul_wrapper_splitK(a, b, kernel_func)
+                else:
+                    output = matmul_wrapper(a, b, kernel_func)
                 end_event.record()
                 end_event.synchronize()
                 times_ms.append(start_event.elapsed_time(end_event))
@@ -327,7 +586,8 @@ def run_performance_test():
              #'V3_Opt_NPU_Parallel (Base Config | Parallel)',
              #'V4_Opt_Full (Full Config | Parallel)',
              'V4_Opt_Full_KPAR (Full Config | Parallel | K-axis Parallelism)',
-             'V4/V1 提速比'
+             'V5_Opt_Full_SplitK (Full Config | Parallel | Split-K)',
+             #'V4/V1 提速比'
              ]]
 
     print(df.to_string(index=False))
